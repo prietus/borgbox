@@ -35,6 +35,8 @@ checksum:
   algorithm: sha256
 
 release:
+  # Replace any pre-existing assets on the release instead of failing.
+  mode: replace
   # Upload install.sh alongside the binaries so
   # github.com/.../releases/latest/download/install.sh works.
   extra_files:
