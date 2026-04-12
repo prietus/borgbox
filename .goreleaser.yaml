@@ -1,0 +1,52 @@
+version: 2
+
+project_name: borgbox
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: borgbox
+    main: .
+    binary: borgbox
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+archives:
+  - id: borgbox
+    # Publish raw binaries (not tarballs) so install.sh can download them
+    # directly with a stable URL.
+    formats: [ binary ]
+    name_template: "borgbox-{{ .Os }}-{{ .Arch }}"
+
+checksum:
+  name_template: "SHA256SUMS"
+  algorithm: sha256
+
+release:
+  # Upload install.sh alongside the binaries so
+  # github.com/.../releases/latest/download/install.sh works.
+  extra_files:
+    - glob: ./install.sh
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+
+snapshot:
+  version_template: "{{ .Tag }}-next"
