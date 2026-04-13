@@ -55,8 +55,9 @@ Auth: `Authorization: Bearer <token>` (all endpoints except `/health`).
 | `GET`    | `/api/v1/info`                        | yes  | Version, free disk, uptime, borg version.         |
 | `GET`    | `/api/v1/system/stats`                | yes  | Hostname, host uptime, load avg, storage.         |
 | `GET`    | `/api/v1/sessions`                    | yes  | Active `borg serve` processes (from `/proc`).     |
-| `GET`    | `/api/v1/repos`                       | yes  | List all repos with size and init state.          |
+| `GET`    | `/api/v1/repos`                       | yes  | List all repos with `ssh_url` and `registered`.   |
 | `POST`   | `/api/v1/repos`                       | yes  | Create repo directory and register pubkey.        |
+| `POST`   | `/api/v1/repos/import`                | yes  | Register an existing on-disk repo (no mkdir).     |
 | `GET`    | `/api/v1/repos/{name}`                | yes  | Detailed stats for one repo.                      |
 | `DELETE` | `/api/v1/repos/{name}`                | yes  | Remove directory and authorized_keys entry.       |
 | `GET`    | `/api/v1/repos/{name}/archives`       | yes  | List archives via `borg list --json`.             |
@@ -66,6 +67,7 @@ Auth: `Authorization: Bearer <token>` (all endpoints except `/health`).
 | `POST`   | `/api/v1/repos/{name}/compact`        | yes  | Async `borg compact`.                             |
 | `GET`    | `/api/v1/jobs`                        | yes  | List recent jobs (in-memory, max 200).            |
 | `GET`    | `/api/v1/jobs/{id}`                   | yes  | Status, exit code and last 200 log lines.         |
+| `GET`    | `/api/v1/jobs/{id}/stream`            | yes  | Server-Sent Events stream of log + status.        |
 
 ### Create a repo
 
@@ -80,17 +82,83 @@ Authorization: Bearer <token>
 }
 ```
 
-`201 Created` on success. `409 Conflict` if a repo with that name already has
-a key registered. `400` for invalid inputs.
+`201 Created` returns the full `repoInfo` including `ssh_url` and
+`registered: true`:
+
+```json
+{
+  "name": "mac",
+  "path": "/var/lib/borg/repos/mac",
+  "ssh_url": "ssh://borg@hive.local/var/lib/borg/repos/mac",
+  "registered": true,
+  "size_bytes": 0,
+  "initialized": false,
+  "modified_at": "2026-04-13T14:32:08Z"
+}
+```
+
+`409 Conflict` if a repo with that name already has a key registered. `400`
+for invalid inputs.
 
 After a successful create, the client app can run:
 
 ```bash
-borg init --encryption=repokey-blake2 ssh://borg@<host>/./repos/mac
+borg init --encryption=repokey-blake2 <ssh_url>
 ```
 
 The daemon never calls `borg init` itself — it only prepares the server side
 so the client's first `borg init` over SSH succeeds.
+
+### List and import existing repos
+
+`GET /api/v1/repos` walks the repo root and returns every directory it finds,
+whether or not it was created by borgbox. The `registered` field tells the
+client which ones already have an `authorized_keys` entry:
+
+```json
+[
+  {
+    "name": "mac",
+    "ssh_url": "ssh://borg@hive.local/var/lib/borg/repos/mac",
+    "registered": true,
+    "initialized": true,
+    "size_bytes": 12345678,
+    "path": "/var/lib/borg/repos/mac",
+    "modified_at": "2026-04-13T14:32:08Z"
+  },
+  {
+    "name": "nas-archive",
+    "ssh_url": "ssh://borg@hive.local/var/lib/borg/repos/nas-archive",
+    "registered": false,
+    "initialized": true,
+    "size_bytes": 987654321,
+    "path": "/var/lib/borg/repos/nas-archive",
+    "modified_at": "2026-02-10T08:11:44Z"
+  }
+]
+```
+
+A client can import one of the unregistered repos (attach a new pubkey to the
+existing directory, no mkdir) with:
+
+```http
+POST /api/v1/repos/import
+Content-Type: application/json
+Authorization: Bearer <token>
+
+{
+  "name": "nas-archive",
+  "pubkey": "ssh-ed25519 AAAAC3... user@host"
+}
+```
+
+Responses:
+- `201 Created` with the `repoInfo` (now `registered: true`).
+- `404 Not Found` if the directory does not exist under the repo root.
+- `400 Bad Request` if the directory exists but is not a borg repo (missing
+  `config` file).
+- `409 Conflict` if an `authorized_keys` entry tagged `# borgbox:<name>`
+  already exists.
 
 ### List archives
 
@@ -160,6 +228,39 @@ while the job is still queued or running. The job registry is in-memory only,
 capped at 200 jobs (oldest finished are evicted first), and is wiped on
 borgbox restart.
 
+### Streaming job output (SSE)
+
+For long-running `check`/`prune`/`compact` jobs, the admin UI can subscribe to
+a live feed instead of polling `/jobs/{id}`:
+
+```http
+GET /api/v1/jobs/j_8f2a4c/stream
+Accept: text/event-stream
+Authorization: Bearer <token>
+```
+
+The response is a `text/event-stream`. On connect, borgbox replays the current
+`log_tail` and emits the current `status`, then keeps the connection open and
+pushes new events as the underlying `borg` process writes to stdout/stderr.
+When the job finishes, a final `status` event is emitted followed by `end`:
+
+```
+event: log
+data: {"type":"log","line":"Starting repository check","status":"","exit_code":0}
+
+event: log
+data: {"type":"log","line":"finished segment check","status":"","exit_code":0}
+
+event: status
+data: {"type":"status","line":"","status":"done","exit_code":0}
+
+event: end
+data: {}
+```
+
+Comments (`: ping`) are sent every 15s as keep-alive. `404` if the job ID is
+unknown (jobs older than the 200-entry cap may have been evicted).
+
 ## What borgbox is *not*
 
 - Not a borg server. `borg serve` is invoked by sshd via a forced command in
@@ -196,7 +297,7 @@ goreleaser produces in CI.
 Tag the commit and push:
 
 ```bash
-git tag v0.2.0
+git tag v0.3.0
 git push --tags
 ```
 
@@ -214,5 +315,8 @@ The daemon reads these env vars (also accepted as CLI flags):
 | `BORGBOX_REPO_ROOT`       | `~borg/repos`            | Where repo directories live.                  |
 | `BORGBOX_AUTH_KEYS`       | `~borg/.ssh/authorized_keys` | File to append SSH keys to.               |
 | `BORGBOX_TOKEN`           | *(required)*             | Bearer token. Prefix with `@` to read a file. |
+| `BORGBOX_SSH_HOST`        | `hostname`               | Hostname used to build `ssh_url` in repo responses. |
+| `BORGBOX_SSH_USER`        | current user             | User used in `ssh_url` (usually `borg`).      |
+| `BORGBOX_SSH_PORT`        | `22`                     | Port included in `ssh_url` when non-default.  |
 
 The installer writes these to `/etc/borgbox/borgbox.env`.

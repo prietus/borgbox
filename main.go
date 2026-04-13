@@ -24,10 +24,11 @@ import (
 	"time"
 )
 
-const version = "0.2.0"
+const version = "0.3.0"
 
 var nameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 var jobIDRe = regexp.MustCompile(`^j_[a-f0-9]{1,32}$`)
+var borgboxTagRe = regexp.MustCompile(`# borgbox:([a-z0-9][a-z0-9-]*)`)
 
 var errKeyExists = errors.New("repo already registered; delete first or use a different name")
 
@@ -36,6 +37,9 @@ type Config struct {
 	RepoRoot string
 	AuthKeys string
 	Token    string
+	SSHHost  string
+	SSHUser  string
+	SSHPort  int
 }
 
 type Server struct {
@@ -53,6 +57,8 @@ type createRepoReq struct {
 type repoInfo struct {
 	Name        string `json:"name"`
 	Path        string `json:"path"`
+	SSHURL      string `json:"ssh_url"`
+	Registered  bool   `json:"registered"`
 	SizeBytes   int64  `json:"size_bytes"`
 	Initialized bool   `json:"initialized"`
 	ModifiedAt  string `json:"modified_at"`
@@ -120,6 +126,14 @@ type jobRec struct {
 	ExitCode   int      `json:"exit_code"`
 	DryRun     bool     `json:"dry_run"`
 	LogTail    []string `json:"log_tail"`
+	subs       []chan jobEvent
+}
+
+type jobEvent struct {
+	Type     string `json:"type"`
+	Line     string `json:"line"`
+	Status   string `json:"status"`
+	ExitCode int    `json:"exit_code"`
 }
 
 type checkReq struct {
@@ -234,6 +248,13 @@ func (jm *jobManager) appendLog(id, line string) {
 		j.LogTail = j.LogTail[len(j.LogTail)-maxLogLines+1:]
 	}
 	j.LogTail = append(j.LogTail, line)
+	ev := jobEvent{Type: "log", Line: line}
+	for _, ch := range j.subs {
+		select {
+		case ch <- ev:
+		default:
+		}
+	}
 }
 
 func (jm *jobManager) setStatus(id, status string, exit int) {
@@ -248,6 +269,54 @@ func (jm *jobManager) setStatus(id, status string, exit int) {
 		j.FinishedAt = time.Now().UTC().Format(time.RFC3339)
 		j.ExitCode = exit
 	}
+	ev := jobEvent{Type: "status", Status: status, ExitCode: exit}
+	for _, ch := range j.subs {
+		select {
+		case ch <- ev:
+		default:
+		}
+	}
+	if status == "done" || status == "error" {
+		for _, ch := range j.subs {
+			close(ch)
+		}
+		j.subs = nil
+	}
+}
+
+func (jm *jobManager) subscribe(id string) (<-chan jobEvent, func(), bool) {
+	jm.mu.Lock()
+	defer jm.mu.Unlock()
+	j, ok := jm.jobs[id]
+	if !ok {
+		return nil, nil, false
+	}
+	ch := make(chan jobEvent, maxLogLines*2)
+	for _, line := range j.LogTail {
+		ch <- jobEvent{Type: "log", Line: line}
+	}
+	if j.Status == "done" || j.Status == "error" {
+		ch <- jobEvent{Type: "status", Status: j.Status, ExitCode: j.ExitCode}
+		close(ch)
+		return ch, func() {}, true
+	}
+	ch <- jobEvent{Type: "status", Status: j.Status, ExitCode: -1}
+	j.subs = append(j.subs, ch)
+	unsub := func() {
+		jm.mu.Lock()
+		defer jm.mu.Unlock()
+		jj, ok := jm.jobs[id]
+		if !ok {
+			return
+		}
+		for i, c := range jj.subs {
+			if c == ch {
+				jj.subs = append(jj.subs[:i], jj.subs[i+1:]...)
+				return
+			}
+		}
+	}
+	return ch, unsub, true
 }
 
 func (jm *jobManager) run(id string, cmd *exec.Cmd) {
@@ -299,6 +368,8 @@ func main() {
 	flag.StringVar(&cfg.RepoRoot, "repo-root", env("BORGBOX_REPO_ROOT", ""), "directory where repos live")
 	flag.StringVar(&cfg.AuthKeys, "authorized-keys", env("BORGBOX_AUTH_KEYS", ""), "authorized_keys path to manage")
 	flag.StringVar(&cfg.Token, "token", env("BORGBOX_TOKEN", ""), "bearer token (use @/path to read from file)")
+	flag.StringVar(&cfg.SSHHost, "ssh-host", env("BORGBOX_SSH_HOST", ""), "hostname used to build ssh_url in repo responses")
+	flag.StringVar(&cfg.SSHUser, "ssh-user", env("BORGBOX_SSH_USER", ""), "user used to build ssh_url (default: current user)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
@@ -316,6 +387,22 @@ func main() {
 		if u, err := user.Current(); err == nil {
 			cfg.AuthKeys = filepath.Join(u.HomeDir, ".ssh", "authorized_keys")
 		}
+	}
+	if cfg.SSHHost == "" {
+		cfg.SSHHost, _ = os.Hostname()
+	}
+	if cfg.SSHUser == "" {
+		if u, err := user.Current(); err == nil {
+			cfg.SSHUser = u.Username
+		}
+	}
+	if p := env("BORGBOX_SSH_PORT", ""); p != "" {
+		if n, err := strconv.Atoi(p); err == nil {
+			cfg.SSHPort = n
+		}
+	}
+	if cfg.SSHPort == 0 {
+		cfg.SSHPort = 22
 	}
 	if strings.HasPrefix(cfg.Token, "@") {
 		b, err := os.ReadFile(strings.TrimPrefix(cfg.Token, "@"))
@@ -340,6 +427,7 @@ func main() {
 	mux.HandleFunc("GET /api/v1/sessions", s.auth(s.listSessions))
 	mux.HandleFunc("GET /api/v1/repos", s.auth(s.listRepos))
 	mux.HandleFunc("POST /api/v1/repos", s.auth(s.createRepo))
+	mux.HandleFunc("POST /api/v1/repos/import", s.auth(s.importRepo))
 	mux.HandleFunc("GET /api/v1/repos/{name}", s.auth(s.getRepo))
 	mux.HandleFunc("DELETE /api/v1/repos/{name}", s.auth(s.deleteRepo))
 	mux.HandleFunc("GET /api/v1/repos/{name}/archives", s.auth(s.listArchives))
@@ -349,6 +437,7 @@ func main() {
 	mux.HandleFunc("POST /api/v1/repos/{name}/compact", s.auth(s.compactRepo))
 	mux.HandleFunc("GET /api/v1/jobs", s.auth(s.listJobs))
 	mux.HandleFunc("GET /api/v1/jobs/{id}", s.auth(s.getJob))
+	mux.HandleFunc("GET /api/v1/jobs/{id}/stream", s.auth(s.streamJob))
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
@@ -384,6 +473,12 @@ type statusRecorder struct {
 func (s *statusRecorder) WriteHeader(c int) {
 	s.code = c
 	s.ResponseWriter.WriteHeader(c)
+}
+
+func (s *statusRecorder) Flush() {
+	if f, ok := s.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 func (s *Server) auth(h http.HandlerFunc) http.HandlerFunc {
@@ -436,6 +531,7 @@ func (s *Server) listRepos(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	registered := s.registeredRepos()
 	out := []repoInfo{}
 	for _, e := range entries {
 		if !e.IsDir() {
@@ -443,18 +539,47 @@ func (s *Server) listRepos(w http.ResponseWriter, r *http.Request) {
 		}
 		p := filepath.Join(s.cfg.RepoRoot, e.Name())
 		info, _ := e.Info()
-		ri := repoInfo{
-			Name:        e.Name(),
-			Path:        p,
-			Initialized: fileExists(filepath.Join(p, "config")),
-			SizeBytes:   dirSize(p),
-		}
-		if info != nil {
-			ri.ModifiedAt = info.ModTime().UTC().Format(time.RFC3339)
-		}
-		out = append(out, ri)
+		out = append(out, s.buildRepoInfo(e.Name(), p, info, registered))
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) sshURL(repoPath string) string {
+	if s.cfg.SSHHost == "" || s.cfg.SSHUser == "" {
+		return ""
+	}
+	port := ""
+	if s.cfg.SSHPort != 0 && s.cfg.SSHPort != 22 {
+		port = fmt.Sprintf(":%d", s.cfg.SSHPort)
+	}
+	return fmt.Sprintf("ssh://%s@%s%s%s", s.cfg.SSHUser, s.cfg.SSHHost, port, repoPath)
+}
+
+func (s *Server) registeredRepos() map[string]bool {
+	out := map[string]bool{}
+	b, err := os.ReadFile(s.cfg.AuthKeys)
+	if err != nil {
+		return out
+	}
+	for _, m := range borgboxTagRe.FindAllStringSubmatch(string(b), -1) {
+		out[m[1]] = true
+	}
+	return out
+}
+
+func (s *Server) buildRepoInfo(name, path string, info os.FileInfo, registered map[string]bool) repoInfo {
+	ri := repoInfo{
+		Name:        name,
+		Path:        path,
+		SSHURL:      s.sshURL(path),
+		Registered:  registered[name],
+		SizeBytes:   dirSize(path),
+		Initialized: fileExists(filepath.Join(path, "config")),
+	}
+	if info != nil {
+		ri.ModifiedAt = info.ModTime().UTC().Format(time.RFC3339)
+	}
+	return ri
 }
 
 func (s *Server) createRepo(w http.ResponseWriter, r *http.Request) {
@@ -493,13 +618,50 @@ func (s *Server) createRepo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	st, _ := os.Stat(repoPath)
-	mt := ""
-	if st != nil {
-		mt = st.ModTime().UTC().Format(time.RFC3339)
+	ri := s.buildRepoInfo(req.Name, repoPath, st, map[string]bool{req.Name: true})
+	writeJSON(w, http.StatusCreated, ri)
+}
+
+func (s *Server) importRepo(w http.ResponseWriter, r *http.Request) {
+	var req createRepoReq
+	if err := json.NewDecoder(io.LimitReader(r.Body, 16*1024)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid json")
+		return
 	}
-	writeJSON(w, http.StatusCreated, repoInfo{
-		Name: req.Name, Path: repoPath, Initialized: false, ModifiedAt: mt,
-	})
+	req.Name = strings.TrimSpace(req.Name)
+	req.Pubkey = strings.TrimSpace(req.Pubkey)
+	if !nameRe.MatchString(req.Name) {
+		writeErr(w, http.StatusBadRequest, "invalid name (lowercase alnum and dashes, max 63)")
+		return
+	}
+	if !validPubkey(req.Pubkey) {
+		writeErr(w, http.StatusBadRequest, "invalid ssh public key")
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	repoPath := filepath.Join(s.cfg.RepoRoot, req.Name)
+	st, err := os.Stat(repoPath)
+	if err != nil || !st.IsDir() {
+		writeErr(w, http.StatusNotFound, "repo directory not found")
+		return
+	}
+	if !fileExists(filepath.Join(repoPath, "config")) {
+		writeErr(w, http.StatusBadRequest, "not a borg repo (missing config)")
+		return
+	}
+	if err := s.addAuthorizedKey(req.Name, req.Pubkey); err != nil {
+		if errors.Is(err, errKeyExists) {
+			writeErr(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "authorized_keys: "+err.Error())
+		return
+	}
+	ri := s.buildRepoInfo(req.Name, repoPath, st, map[string]bool{req.Name: true})
+	writeJSON(w, http.StatusCreated, ri)
 }
 
 func (s *Server) getRepo(w http.ResponseWriter, r *http.Request) {
@@ -514,13 +676,8 @@ func (s *Server) getRepo(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "repo not found")
 		return
 	}
-	out := repoDetail{repoInfo: repoInfo{
-		Name:        name,
-		Path:        repoPath,
-		SizeBytes:   dirSize(repoPath),
-		Initialized: fileExists(filepath.Join(repoPath, "config")),
-		ModifiedAt:  st.ModTime().UTC().Format(time.RFC3339),
-	}}
+	registered := s.registeredRepos()
+	out := repoDetail{repoInfo: s.buildRepoInfo(name, repoPath, st, registered)}
 	if out.Initialized {
 		parseRepoConfig(filepath.Join(repoPath, "config"), &out)
 		out.Segments, out.LastWrite = scanDataDir(filepath.Join(repoPath, "data"))
@@ -917,7 +1074,7 @@ func (s *Server) checkRepo(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "repo not initialized")
 		return
 	}
-	args := []string{"check"}
+	args := []string{"check", "--info"}
 	if req.Repair {
 		args = append(args, "--repair")
 	}
@@ -993,7 +1150,7 @@ func (s *Server) compactRepo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	j := s.jobs.create(name, "compact", false)
-	cmd := exec.Command("borg", "compact", repoPath)
+	cmd := exec.Command("borg", "compact", "--info", repoPath)
 	cmd.Env = borgEnv(req.Passphrase)
 	go s.jobs.run(j.ID, cmd)
 	writeJSON(w, http.StatusAccepted, map[string]string{"job_id": j.ID, "status": j.Status})
@@ -1019,4 +1176,60 @@ func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, j)
+}
+
+func (s *Server) streamJob(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !jobIDRe.MatchString(id) {
+		writeErr(w, http.StatusBadRequest, "invalid job id")
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeErr(w, http.StatusInternalServerError, "streaming not supported")
+		return
+	}
+	ch, unsub, ok := s.jobs.subscribe(id)
+	if !ok {
+		writeErr(w, http.StatusNotFound, "job not found")
+		return
+	}
+	defer unsub()
+
+	h := w.Header()
+	h.Set("Content-Type", "text/event-stream")
+	h.Set("Cache-Control", "no-cache")
+	h.Set("Connection", "keep-alive")
+	h.Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	ctx := r.Context()
+	ping := time.NewTicker(15 * time.Second)
+	defer ping.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ping.C:
+			if _, err := fmt.Fprint(w, ": ping\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+		case ev, open := <-ch:
+			if !open {
+				fmt.Fprint(w, "event: end\ndata: {}\n\n")
+				flusher.Flush()
+				return
+			}
+			b, err := json.Marshal(ev)
+			if err != nil {
+				continue
+			}
+			if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.Type, b); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
 }
