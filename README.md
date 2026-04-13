@@ -49,14 +49,23 @@ sudo ./install.sh --dist ./dist
 Base URL: `http://<host>:9999/api/v1`
 Auth: `Authorization: Bearer <token>` (all endpoints except `/health`).
 
-| Method   | Path                      | Auth | Description                                 |
-|----------|---------------------------|------|---------------------------------------------|
-| `GET`    | `/api/v1/health`          | no   | Liveness check.                             |
-| `GET`    | `/api/v1/info`            | yes  | Version, free disk, uptime, borg version.   |
-| `GET`    | `/api/v1/repos`           | yes  | List all repos with size and init state.    |
-| `POST`   | `/api/v1/repos`           | yes  | Create repo directory and register pubkey.  |
-| `GET`    | `/api/v1/repos/{name}`    | yes  | Detailed stats for one repo.                |
-| `DELETE` | `/api/v1/repos/{name}`    | yes  | Remove directory and authorized_keys entry. |
+| Method   | Path                                  | Auth | Description                                       |
+|----------|---------------------------------------|------|---------------------------------------------------|
+| `GET`    | `/api/v1/health`                      | no   | Liveness check.                                   |
+| `GET`    | `/api/v1/info`                        | yes  | Version, free disk, uptime, borg version.         |
+| `GET`    | `/api/v1/system/stats`                | yes  | Hostname, host uptime, load avg, storage.         |
+| `GET`    | `/api/v1/sessions`                    | yes  | Active `borg serve` processes (from `/proc`).     |
+| `GET`    | `/api/v1/repos`                       | yes  | List all repos with size and init state.          |
+| `POST`   | `/api/v1/repos`                       | yes  | Create repo directory and register pubkey.        |
+| `GET`    | `/api/v1/repos/{name}`                | yes  | Detailed stats for one repo.                      |
+| `DELETE` | `/api/v1/repos/{name}`                | yes  | Remove directory and authorized_keys entry.       |
+| `GET`    | `/api/v1/repos/{name}/archives`       | yes  | List archives via `borg list --json`.             |
+| `POST`   | `/api/v1/repos/{name}/break-lock`     | yes  | Run `borg break-lock` on a stuck repo (sync).     |
+| `POST`   | `/api/v1/repos/{name}/check`          | yes  | Async `borg check`. Returns `job_id`.             |
+| `POST`   | `/api/v1/repos/{name}/prune`          | yes  | Async `borg prune` with retention policy.         |
+| `POST`   | `/api/v1/repos/{name}/compact`        | yes  | Async `borg compact`.                             |
+| `GET`    | `/api/v1/jobs`                        | yes  | List recent jobs (in-memory, max 200).            |
+| `GET`    | `/api/v1/jobs/{id}`                   | yes  | Status, exit code and last 200 log lines.         |
 
 ### Create a repo
 
@@ -82,6 +91,74 @@ borg init --encryption=repokey-blake2 ssh://borg@<host>/./repos/mac
 
 The daemon never calls `borg init` itself — it only prepares the server side
 so the client's first `borg init` over SSH succeeds.
+
+### List archives
+
+```http
+GET /api/v1/repos/mac/archives
+Authorization: Bearer <token>
+X-Borg-Passphrase: <passphrase>      # only for encrypted repos
+```
+
+Returns the array of archives reported by `borg list --json`. The header is
+discarded after the call — borgbox never persists passphrases.
+
+### Maintenance jobs (async)
+
+`check`, `prune` and `compact` return `202 Accepted` with a `job_id`. Poll
+`/api/v1/jobs/{id}` to follow progress.
+
+```http
+POST /api/v1/repos/mac/check
+Content-Type: application/json
+Authorization: Bearer <token>
+
+{ "repair": false, "verify_data": false, "passphrase": "..." }
+```
+
+```http
+POST /api/v1/repos/mac/prune
+Content-Type: application/json
+Authorization: Bearer <token>
+
+{
+  "keep_daily":   7,
+  "keep_weekly":  4,
+  "keep_monthly": 12,
+  "keep_yearly":  2,
+  "dry_run":      false,
+  "passphrase":   "..."
+}
+```
+
+```http
+POST /api/v1/repos/mac/compact
+Content-Type: application/json
+Authorization: Bearer <token>
+
+{ "passphrase": "..." }
+```
+
+Job record:
+
+```json
+{
+  "id": "j_8f2a4c",
+  "repo": "mac",
+  "kind": "check",
+  "status": "running",
+  "started_at": "2026-04-13T10:02:17Z",
+  "finished_at": "",
+  "exit_code": -1,
+  "dry_run": false,
+  "log_tail": ["Starting repository check", "..."]
+}
+```
+
+`status` is one of `queued`, `running`, `done`, `error`. `exit_code` is `-1`
+while the job is still queued or running. The job registry is in-memory only,
+capped at 200 jobs (oldest finished are evicted first), and is wiped on
+borgbox restart.
 
 ## What borgbox is *not*
 

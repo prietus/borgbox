@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -15,15 +16,18 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 var nameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
+var jobIDRe = regexp.MustCompile(`^j_[a-f0-9]{1,32}$`)
 
 var errKeyExists = errors.New("repo already registered; delete first or use a different name")
 
@@ -38,6 +42,7 @@ type Server struct {
 	cfg   Config
 	start time.Time
 	mu    sync.Mutex
+	jobs  *jobManager
 }
 
 type createRepoReq struct {
@@ -63,13 +68,229 @@ type repoDetail struct {
 }
 
 type infoResp struct {
-	Version      string `json:"version"`
-	RepoRoot     string `json:"repo_root"`
-	FreeBytes    uint64 `json:"free_bytes"`
-	TotalBytes   uint64 `json:"total_bytes"`
-	UptimeSec    int64  `json:"uptime_sec"`
-	BorgVersion  string `json:"borg_version,omitempty"`
-	GoVersion    string `json:"go_version"`
+	Version     string `json:"version"`
+	RepoRoot    string `json:"repo_root"`
+	FreeBytes   uint64 `json:"free_bytes"`
+	TotalBytes  uint64 `json:"total_bytes"`
+	UptimeSec   int64  `json:"uptime_sec"`
+	BorgVersion string `json:"borg_version"`
+	GoVersion   string `json:"go_version"`
+}
+
+type archiveInfo struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Hostname string `json:"hostname"`
+	Username string `json:"username"`
+	Time     string `json:"time"`
+	Comment  string `json:"comment"`
+}
+
+type storageInfo struct {
+	Path       string `json:"path"`
+	TotalBytes uint64 `json:"total_bytes"`
+	UsedBytes  uint64 `json:"used_bytes"`
+	FreeBytes  uint64 `json:"free_bytes"`
+}
+
+type systemStatsResp struct {
+	Hostname       string      `json:"hostname"`
+	UptimeSeconds  int64       `json:"uptime_seconds"`
+	Load           [3]float64  `json:"load"`
+	Storage        storageInfo `json:"storage"`
+	BorgboxVersion string      `json:"borgbox_version"`
+	BorgVersion    string      `json:"borg_version"`
+}
+
+type sessionInfo struct {
+	PID       int    `json:"pid"`
+	Repo      string `json:"repo"`
+	RepoPath  string `json:"repo_path"`
+	StartedAt string `json:"started_at"`
+	RSSBytes  int64  `json:"rss_bytes"`
+}
+
+type jobRec struct {
+	ID         string   `json:"id"`
+	Repo       string   `json:"repo"`
+	Kind       string   `json:"kind"`
+	Status     string   `json:"status"`
+	StartedAt  string   `json:"started_at"`
+	FinishedAt string   `json:"finished_at"`
+	ExitCode   int      `json:"exit_code"`
+	DryRun     bool     `json:"dry_run"`
+	LogTail    []string `json:"log_tail"`
+}
+
+type checkReq struct {
+	Repair     bool   `json:"repair"`
+	VerifyData bool   `json:"verify_data"`
+	Passphrase string `json:"passphrase"`
+}
+
+type pruneReq struct {
+	KeepDaily   int    `json:"keep_daily"`
+	KeepWeekly  int    `json:"keep_weekly"`
+	KeepMonthly int    `json:"keep_monthly"`
+	KeepYearly  int    `json:"keep_yearly"`
+	DryRun      bool   `json:"dry_run"`
+	Passphrase  string `json:"passphrase"`
+}
+
+type compactReq struct {
+	Passphrase string `json:"passphrase"`
+}
+
+const (
+	maxLogLines = 200
+	maxJobs     = 200
+)
+
+type jobManager struct {
+	mu   sync.Mutex
+	jobs map[string]*jobRec
+}
+
+func newJobManager() *jobManager {
+	return &jobManager{jobs: map[string]*jobRec{}}
+}
+
+func (jm *jobManager) create(repo, kind string, dryRun bool) *jobRec {
+	jm.mu.Lock()
+	defer jm.mu.Unlock()
+	jm.gcLocked()
+	id := fmt.Sprintf("j_%x", time.Now().UnixNano())
+	j := &jobRec{
+		ID:        id,
+		Repo:      repo,
+		Kind:      kind,
+		Status:    "queued",
+		StartedAt: time.Now().UTC().Format(time.RFC3339),
+		ExitCode:  -1,
+		DryRun:    dryRun,
+		LogTail:   []string{},
+	}
+	jm.jobs[id] = j
+	return j
+}
+
+func (jm *jobManager) gcLocked() {
+	if len(jm.jobs) < maxJobs {
+		return
+	}
+	type ref struct {
+		id   string
+		when string
+	}
+	finished := make([]ref, 0, len(jm.jobs))
+	for id, j := range jm.jobs {
+		if j.Status == "done" || j.Status == "error" {
+			finished = append(finished, ref{id, j.StartedAt})
+		}
+	}
+	sort.Slice(finished, func(i, j int) bool { return finished[i].when < finished[j].when })
+	for _, r := range finished {
+		if len(jm.jobs) < maxJobs {
+			break
+		}
+		delete(jm.jobs, r.id)
+	}
+}
+
+func (jm *jobManager) get(id string) (*jobRec, bool) {
+	jm.mu.Lock()
+	defer jm.mu.Unlock()
+	j, ok := jm.jobs[id]
+	if !ok {
+		return nil, false
+	}
+	clone := *j
+	clone.LogTail = make([]string, len(j.LogTail))
+	copy(clone.LogTail, j.LogTail)
+	return &clone, true
+}
+
+func (jm *jobManager) list() []*jobRec {
+	jm.mu.Lock()
+	defer jm.mu.Unlock()
+	out := make([]*jobRec, 0, len(jm.jobs))
+	for _, j := range jm.jobs {
+		clone := *j
+		clone.LogTail = append([]string(nil), j.LogTail...)
+		out = append(out, &clone)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].StartedAt > out[j].StartedAt })
+	return out
+}
+
+func (jm *jobManager) appendLog(id, line string) {
+	jm.mu.Lock()
+	defer jm.mu.Unlock()
+	j, ok := jm.jobs[id]
+	if !ok {
+		return
+	}
+	if len(j.LogTail) >= maxLogLines {
+		j.LogTail = j.LogTail[len(j.LogTail)-maxLogLines+1:]
+	}
+	j.LogTail = append(j.LogTail, line)
+}
+
+func (jm *jobManager) setStatus(id, status string, exit int) {
+	jm.mu.Lock()
+	defer jm.mu.Unlock()
+	j, ok := jm.jobs[id]
+	if !ok {
+		return
+	}
+	j.Status = status
+	if status == "done" || status == "error" {
+		j.FinishedAt = time.Now().UTC().Format(time.RFC3339)
+		j.ExitCode = exit
+	}
+}
+
+func (jm *jobManager) run(id string, cmd *exec.Cmd) {
+	jm.setStatus(id, "running", -1)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		jm.appendLog(id, "stdout pipe: "+err.Error())
+		jm.setStatus(id, "error", -2)
+		return
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		jm.appendLog(id, "stderr pipe: "+err.Error())
+		jm.setStatus(id, "error", -2)
+		return
+	}
+	if err := cmd.Start(); err != nil {
+		jm.appendLog(id, "start: "+err.Error())
+		jm.setStatus(id, "error", -2)
+		return
+	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	scan := func(r io.Reader) {
+		defer wg.Done()
+		sc := bufio.NewScanner(r)
+		sc.Buffer(make([]byte, 64*1024), 1024*1024)
+		for sc.Scan() {
+			jm.appendLog(id, sc.Text())
+		}
+	}
+	go scan(stdout)
+	go scan(stderr)
+	wg.Wait()
+	if err := cmd.Wait(); err != nil {
+		code := -2
+		if ee, ok := err.(*exec.ExitError); ok {
+			code = ee.ExitCode()
+		}
+		jm.setStatus(id, "error", code)
+		return
+	}
+	jm.setStatus(id, "done", 0)
 }
 
 func main() {
@@ -110,15 +331,24 @@ func main() {
 		log.Fatalf("mkdir repo root %q: %v", cfg.RepoRoot, err)
 	}
 
-	s := &Server{cfg: cfg, start: time.Now()}
+	s := &Server{cfg: cfg, start: time.Now(), jobs: newJobManager()}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/health", s.health)
 	mux.HandleFunc("GET /api/v1/info", s.auth(s.info))
+	mux.HandleFunc("GET /api/v1/system/stats", s.auth(s.systemStats))
+	mux.HandleFunc("GET /api/v1/sessions", s.auth(s.listSessions))
 	mux.HandleFunc("GET /api/v1/repos", s.auth(s.listRepos))
 	mux.HandleFunc("POST /api/v1/repos", s.auth(s.createRepo))
 	mux.HandleFunc("GET /api/v1/repos/{name}", s.auth(s.getRepo))
 	mux.HandleFunc("DELETE /api/v1/repos/{name}", s.auth(s.deleteRepo))
+	mux.HandleFunc("GET /api/v1/repos/{name}/archives", s.auth(s.listArchives))
+	mux.HandleFunc("POST /api/v1/repos/{name}/break-lock", s.auth(s.breakLock))
+	mux.HandleFunc("POST /api/v1/repos/{name}/check", s.auth(s.checkRepo))
+	mux.HandleFunc("POST /api/v1/repos/{name}/prune", s.auth(s.pruneRepo))
+	mux.HandleFunc("POST /api/v1/repos/{name}/compact", s.auth(s.compactRepo))
+	mux.HandleFunc("GET /api/v1/jobs", s.auth(s.listJobs))
+	mux.HandleFunc("GET /api/v1/jobs/{id}", s.auth(s.getJob))
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
@@ -467,4 +697,326 @@ func borgVersion() string {
 		return ""
 	}
 	return strings.TrimSpace(string(out))
+}
+
+func borgEnv(passphrase string) []string {
+	e := append([]string{}, os.Environ()...)
+	e = append(e,
+		"BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK=yes",
+		"BORG_RELOCATED_REPO_ACCESS_IS_OK=yes",
+	)
+	if passphrase != "" {
+		e = append(e, "BORG_PASSPHRASE="+passphrase)
+	}
+	return e
+}
+
+func hostUptime() int64 {
+	b, err := os.ReadFile("/proc/uptime")
+	if err != nil {
+		return 0
+	}
+	parts := strings.Fields(string(b))
+	if len(parts) == 0 {
+		return 0
+	}
+	v, err := strconv.ParseFloat(parts[0], 64)
+	if err != nil {
+		return 0
+	}
+	return int64(v)
+}
+
+func loadAvg() [3]float64 {
+	var l [3]float64
+	b, err := os.ReadFile("/proc/loadavg")
+	if err != nil {
+		return l
+	}
+	parts := strings.Fields(string(b))
+	if len(parts) < 3 {
+		return l
+	}
+	for i := 0; i < 3; i++ {
+		v, _ := strconv.ParseFloat(parts[i], 64)
+		l[i] = v
+	}
+	return l
+}
+
+func (s *Server) systemStats(w http.ResponseWriter, r *http.Request) {
+	var st syscall.Statfs_t
+	var total, free, used uint64
+	if err := syscall.Statfs(s.cfg.RepoRoot, &st); err == nil {
+		total = st.Blocks * uint64(st.Bsize)
+		free = st.Bavail * uint64(st.Bsize)
+		used = total - st.Bfree*uint64(st.Bsize)
+	}
+	host, _ := os.Hostname()
+	writeJSON(w, http.StatusOK, systemStatsResp{
+		Hostname:      host,
+		UptimeSeconds: hostUptime(),
+		Load:          loadAvg(),
+		Storage: storageInfo{
+			Path:       s.cfg.RepoRoot,
+			TotalBytes: total,
+			UsedBytes:  used,
+			FreeBytes:  free,
+		},
+		BorgboxVersion: version,
+		BorgVersion:    borgVersion(),
+	})
+}
+
+func (s *Server) listSessions(w http.ResponseWriter, r *http.Request) {
+	out := []sessionInfo{}
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+	rootAbs, _ := filepath.Abs(s.cfg.RepoRoot)
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		cmdlineBytes, err := os.ReadFile("/proc/" + e.Name() + "/cmdline")
+		if err != nil || len(cmdlineBytes) == 0 {
+			continue
+		}
+		args := strings.Split(strings.TrimRight(string(cmdlineBytes), "\x00"), "\x00")
+		isBorgServe := false
+		for i, a := range args {
+			base := filepath.Base(a)
+			if (base == "borg" || strings.HasPrefix(base, "borg")) && i+1 < len(args) && args[i+1] == "serve" {
+				isBorgServe = true
+				break
+			}
+		}
+		if !isBorgServe {
+			continue
+		}
+		repoPath := ""
+		for i, a := range args {
+			if a == "--restrict-to-repository" && i+1 < len(args) {
+				repoPath = args[i+1]
+				break
+			}
+		}
+		if repoPath == "" {
+			continue
+		}
+		repoAbs, _ := filepath.Abs(repoPath)
+		if rootAbs != "" && !strings.HasPrefix(repoAbs, rootAbs) {
+			continue
+		}
+		rss := int64(0)
+		if sb, err := os.ReadFile("/proc/" + e.Name() + "/status"); err == nil {
+			for _, line := range strings.Split(string(sb), "\n") {
+				if strings.HasPrefix(line, "VmRSS:") {
+					var kb int64
+					fmt.Sscanf(line, "VmRSS: %d kB", &kb)
+					rss = kb * 1024
+					break
+				}
+			}
+		}
+		started := ""
+		if st, err := os.Stat("/proc/" + e.Name()); err == nil {
+			started = st.ModTime().UTC().Format(time.RFC3339)
+		}
+		out = append(out, sessionInfo{
+			PID:       pid,
+			Repo:      filepath.Base(repoPath),
+			RepoPath:  repoPath,
+			StartedAt: started,
+			RSSBytes:  rss,
+		})
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) listArchives(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if !nameRe.MatchString(name) {
+		writeErr(w, http.StatusBadRequest, "invalid name")
+		return
+	}
+	repoPath := filepath.Join(s.cfg.RepoRoot, name)
+	if !fileExists(filepath.Join(repoPath, "config")) {
+		writeErr(w, http.StatusNotFound, "repo not initialized")
+		return
+	}
+	cmd := exec.Command("borg", "list", "--json", repoPath)
+	cmd.Env = borgEnv(r.Header.Get("X-Borg-Passphrase"))
+	out, err := cmd.Output()
+	if err != nil {
+		msg := err.Error()
+		if ee, ok := err.(*exec.ExitError); ok {
+			if s := strings.TrimSpace(string(ee.Stderr)); s != "" {
+				msg = s
+			}
+		}
+		writeErr(w, http.StatusInternalServerError, "borg list: "+msg)
+		return
+	}
+	var parsed struct {
+		Archives []archiveInfo `json:"archives"`
+	}
+	if err := json.Unmarshal(out, &parsed); err != nil {
+		writeErr(w, http.StatusInternalServerError, "parse: "+err.Error())
+		return
+	}
+	if parsed.Archives == nil {
+		parsed.Archives = []archiveInfo{}
+	}
+	writeJSON(w, http.StatusOK, parsed.Archives)
+}
+
+func (s *Server) breakLock(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if !nameRe.MatchString(name) {
+		writeErr(w, http.StatusBadRequest, "invalid name")
+		return
+	}
+	repoPath := filepath.Join(s.cfg.RepoRoot, name)
+	if !fileExists(filepath.Join(repoPath, "config")) {
+		writeErr(w, http.StatusNotFound, "repo not initialized")
+		return
+	}
+	cmd := exec.Command("borg", "break-lock", repoPath)
+	cmd.Env = borgEnv("")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		writeErr(w, http.StatusInternalServerError, "break-lock: "+strings.TrimSpace(string(out)))
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func decodeOptionalJSON(r *http.Request, dst any) error {
+	if r.ContentLength == 0 {
+		return nil
+	}
+	return json.NewDecoder(io.LimitReader(r.Body, 16*1024)).Decode(dst)
+}
+
+func (s *Server) checkRepo(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if !nameRe.MatchString(name) {
+		writeErr(w, http.StatusBadRequest, "invalid name")
+		return
+	}
+	var req checkReq
+	if err := decodeOptionalJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	repoPath := filepath.Join(s.cfg.RepoRoot, name)
+	if !fileExists(filepath.Join(repoPath, "config")) {
+		writeErr(w, http.StatusNotFound, "repo not initialized")
+		return
+	}
+	args := []string{"check"}
+	if req.Repair {
+		args = append(args, "--repair")
+	}
+	if req.VerifyData {
+		args = append(args, "--verify-data")
+	}
+	args = append(args, repoPath)
+	j := s.jobs.create(name, "check", false)
+	cmd := exec.Command("borg", args...)
+	cmd.Env = borgEnv(req.Passphrase)
+	go s.jobs.run(j.ID, cmd)
+	writeJSON(w, http.StatusAccepted, map[string]string{"job_id": j.ID, "status": j.Status})
+}
+
+func (s *Server) pruneRepo(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if !nameRe.MatchString(name) {
+		writeErr(w, http.StatusBadRequest, "invalid name")
+		return
+	}
+	var req pruneReq
+	if err := decodeOptionalJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if req.KeepDaily <= 0 && req.KeepWeekly <= 0 && req.KeepMonthly <= 0 && req.KeepYearly <= 0 {
+		writeErr(w, http.StatusBadRequest, "at least one keep_* must be > 0")
+		return
+	}
+	repoPath := filepath.Join(s.cfg.RepoRoot, name)
+	if !fileExists(filepath.Join(repoPath, "config")) {
+		writeErr(w, http.StatusNotFound, "repo not initialized")
+		return
+	}
+	args := []string{"prune", "--list"}
+	if req.DryRun {
+		args = append(args, "--dry-run")
+	}
+	if req.KeepDaily > 0 {
+		args = append(args, "--keep-daily", strconv.Itoa(req.KeepDaily))
+	}
+	if req.KeepWeekly > 0 {
+		args = append(args, "--keep-weekly", strconv.Itoa(req.KeepWeekly))
+	}
+	if req.KeepMonthly > 0 {
+		args = append(args, "--keep-monthly", strconv.Itoa(req.KeepMonthly))
+	}
+	if req.KeepYearly > 0 {
+		args = append(args, "--keep-yearly", strconv.Itoa(req.KeepYearly))
+	}
+	args = append(args, repoPath)
+	j := s.jobs.create(name, "prune", req.DryRun)
+	cmd := exec.Command("borg", args...)
+	cmd.Env = borgEnv(req.Passphrase)
+	go s.jobs.run(j.ID, cmd)
+	writeJSON(w, http.StatusAccepted, map[string]string{"job_id": j.ID, "status": j.Status})
+}
+
+func (s *Server) compactRepo(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if !nameRe.MatchString(name) {
+		writeErr(w, http.StatusBadRequest, "invalid name")
+		return
+	}
+	var req compactReq
+	if err := decodeOptionalJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	repoPath := filepath.Join(s.cfg.RepoRoot, name)
+	if !fileExists(filepath.Join(repoPath, "config")) {
+		writeErr(w, http.StatusNotFound, "repo not initialized")
+		return
+	}
+	j := s.jobs.create(name, "compact", false)
+	cmd := exec.Command("borg", "compact", repoPath)
+	cmd.Env = borgEnv(req.Passphrase)
+	go s.jobs.run(j.ID, cmd)
+	writeJSON(w, http.StatusAccepted, map[string]string{"job_id": j.ID, "status": j.Status})
+}
+
+func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
+	out := s.jobs.list()
+	if out == nil {
+		out = []*jobRec{}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !jobIDRe.MatchString(id) {
+		writeErr(w, http.StatusBadRequest, "invalid job id")
+		return
+	}
+	j, ok := s.jobs.get(id)
+	if !ok {
+		writeErr(w, http.StatusNotFound, "job not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, j)
 }
