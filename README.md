@@ -320,3 +320,7 @@ The daemon reads these env vars (also accepted as CLI flags):
 | `BORGBOX_SSH_PORT`        | `22`                     | Port included in `ssh_url` when non-default.  |
 
 The installer writes these to `/etc/borgbox/borgbox.env`.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
