@@ -24,7 +24,7 @@ import (
 	"time"
 )
 
-const version = "0.3.0"
+const version = "0.4.0"
 
 var nameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 var jobIDRe = regexp.MustCompile(`^j_[a-f0-9]{1,32}$`)
@@ -33,20 +33,22 @@ var borgboxTagRe = regexp.MustCompile(`# borgbox:([a-z0-9][a-z0-9-]*)`)
 var errKeyExists = errors.New("repo already registered; delete first or use a different name")
 
 type Config struct {
-	Addr     string
-	RepoRoot string
-	AuthKeys string
-	Token    string
-	SSHHost  string
-	SSHUser  string
-	SSHPort  int
+	Addr           string
+	RepoRoot       string
+	AuthKeys       string
+	Token          string
+	SSHHost        string
+	SSHUser        string
+	SSHPort        int
+	SchedulesPath  string
 }
 
 type Server struct {
-	cfg   Config
-	start time.Time
-	mu    sync.Mutex
-	jobs  *jobManager
+	cfg       Config
+	start     time.Time
+	mu        sync.Mutex
+	jobs      *jobManager
+	scheduler *Scheduler
 }
 
 type createRepoReq struct {
@@ -370,6 +372,7 @@ func main() {
 	flag.StringVar(&cfg.Token, "token", env("BORGBOX_TOKEN", ""), "bearer token (use @/path to read from file)")
 	flag.StringVar(&cfg.SSHHost, "ssh-host", env("BORGBOX_SSH_HOST", ""), "hostname used to build ssh_url in repo responses")
 	flag.StringVar(&cfg.SSHUser, "ssh-user", env("BORGBOX_SSH_USER", ""), "user used to build ssh_url (default: current user)")
+	flag.StringVar(&cfg.SchedulesPath, "schedules", env("BORGBOX_SCHEDULES", ""), "path to schedules.json (default: <home>/schedules.json)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
@@ -404,6 +407,11 @@ func main() {
 	if cfg.SSHPort == 0 {
 		cfg.SSHPort = 22
 	}
+	if cfg.SchedulesPath == "" {
+		if u, err := user.Current(); err == nil {
+			cfg.SchedulesPath = filepath.Join(u.HomeDir, "schedules.json")
+		}
+	}
 	if strings.HasPrefix(cfg.Token, "@") {
 		b, err := os.ReadFile(strings.TrimPrefix(cfg.Token, "@"))
 		if err != nil {
@@ -419,6 +427,12 @@ func main() {
 	}
 
 	s := &Server{cfg: cfg, start: time.Now(), jobs: newJobManager()}
+	sched, err := newScheduler(cfg.SchedulesPath, cfg.RepoRoot, s.jobs)
+	if err != nil {
+		log.Fatalf("scheduler init: %v", err)
+	}
+	s.scheduler = sched
+	go s.scheduler.start()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/health", s.health)
@@ -438,6 +452,12 @@ func main() {
 	mux.HandleFunc("GET /api/v1/jobs", s.auth(s.listJobs))
 	mux.HandleFunc("GET /api/v1/jobs/{id}", s.auth(s.getJob))
 	mux.HandleFunc("GET /api/v1/jobs/{id}/stream", s.auth(s.streamJob))
+	mux.HandleFunc("GET /api/v1/schedules", s.auth(s.listSchedules))
+	mux.HandleFunc("GET /api/v1/schedules/{id}", s.auth(s.getSchedule))
+	mux.HandleFunc("PATCH /api/v1/schedules/{id}", s.auth(s.patchSchedule))
+	mux.HandleFunc("DELETE /api/v1/schedules/{id}", s.auth(s.deleteSchedule))
+	mux.HandleFunc("GET /api/v1/repos/{name}/schedules", s.auth(s.listRepoSchedules))
+	mux.HandleFunc("POST /api/v1/repos/{name}/schedules", s.auth(s.createSchedule))
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,

@@ -68,6 +68,12 @@ Auth: `Authorization: Bearer <token>` (all endpoints except `/health`).
 | `GET`    | `/api/v1/jobs`                        | yes  | List recent jobs (in-memory, max 200).            |
 | `GET`    | `/api/v1/jobs/{id}`                   | yes  | Status, exit code and last 200 log lines.         |
 | `GET`    | `/api/v1/jobs/{id}/stream`            | yes  | Server-Sent Events stream of log + status.        |
+| `GET`    | `/api/v1/schedules`                   | yes  | List all scheduled maintenance jobs.              |
+| `GET`    | `/api/v1/schedules/{id}`              | yes  | Fetch one schedule.                               |
+| `PATCH`  | `/api/v1/schedules/{id}`              | yes  | Enable/disable or edit a schedule.                |
+| `DELETE` | `/api/v1/schedules/{id}`              | yes  | Remove a schedule.                                |
+| `GET`    | `/api/v1/repos/{name}/schedules`      | yes  | List schedules for a single repo.                 |
+| `POST`   | `/api/v1/repos/{name}/schedules`      | yes  | Create a schedule for a repo.                     |
 
 ### Create a repo
 
@@ -261,6 +267,97 @@ data: {}
 Comments (`: ping`) are sent every 15s as keep-alive. `404` if the job ID is
 unknown (jobs older than the 200-entry cap may have been evicted).
 
+### Scheduled maintenance
+
+borgbox can run `borg check` and `borg compact` on a schedule so that
+repository maintenance keeps happening even when no client is open. The
+scheduler has a deliberately narrow scope in v0.4.0: it only supports the
+two kinds that do **not** need a passphrase, so no secret ever lives on
+the server.
+
+- `check` runs as `borg check --info --repository-only` — verifies segment
+  integrity, does not decrypt archives.
+- `compact` runs as `borg compact --info` — reclaims space from deleted
+  archives.
+
+Schedules are persisted to `~borg/schedules.json` (configurable via
+`BORGBOX_SCHEDULES`). A tick loop wakes up every 60 seconds and fires any
+schedule whose `next_run` is in the past. Firing happens through the same
+`jobManager` as manual jobs, so scheduled runs show up in `GET /jobs` and
+stream over SSE identically.
+
+If the daemon was down when a schedule should have run, the missed run
+fires **once** on startup (catchup-once semantics — you will not get N
+stacked runs for N missed days). If a job is already running for the
+target repo when the scheduler ticks, the fire is skipped and retried on
+the next minute.
+
+**Cadence model.** Instead of a cron expression, schedules use a typed
+model that covers the common cases without DST footguns:
+
+```json
+{
+  "kind": "check",
+  "cadence": "daily",
+  "hour": 3,
+  "minute": 15,
+  "enabled": true
+}
+```
+
+- `cadence: "daily"` — fires every day at `hour:minute` (server local time).
+- `cadence: "weekly"` — also requires `weekday` (0 = Sunday … 6 = Saturday).
+- `cadence: "monthly"` — also requires `day` (1–28; later days are not
+  supported to avoid the "no 31st in February" edge case).
+
+Hours and minutes are interpreted in the **server's local timezone** (the
+cron convention). `next_run` in responses is always UTC RFC3339.
+
+```
+POST /api/v1/repos/mac/schedules
+Content-Type: application/json
+Authorization: Bearer <token>
+
+{"kind":"check","cadence":"daily","hour":3,"minute":15,"enabled":true}
+```
+
+```json
+{
+  "id": "sch_3a9aa165ec83a4e0",
+  "repo": "mac",
+  "kind": "check",
+  "cadence": "daily",
+  "hour": 3,
+  "minute": 15,
+  "weekday": 0,
+  "day": 0,
+  "enabled": true,
+  "created_at": "2026-04-13T20:42:56Z",
+  "last_run": "",
+  "last_status": "",
+  "last_job_id": "",
+  "next_run": "2026-04-14T01:15:00Z"
+}
+```
+
+Toggle a schedule off without deleting it:
+
+```
+PATCH /api/v1/schedules/sch_3a9aa165ec83a4e0
+{"enabled": false}
+```
+
+Delete:
+
+```
+DELETE /api/v1/schedules/sch_3a9aa165ec83a4e0
+```
+
+Each schedule tracks `last_run`, `last_status` (`running`, `done`,
+`error`, or `skipped` when the repo was gone at fire time) and
+`last_job_id`, so a client can render "last check: 2 days ago ✅" without
+correlating against `/jobs` by hand.
+
 ## What borgbox is *not*
 
 - Not a borg server. `borg serve` is invoked by sshd via a forced command in
@@ -297,7 +394,7 @@ goreleaser produces in CI.
 Tag the commit and push:
 
 ```bash
-git tag v0.3.0
+git tag v0.4.0
 git push --tags
 ```
 
@@ -318,6 +415,7 @@ The daemon reads these env vars (also accepted as CLI flags):
 | `BORGBOX_SSH_HOST`        | `hostname`               | Hostname used to build `ssh_url` in repo responses. |
 | `BORGBOX_SSH_USER`        | current user             | User used in `ssh_url` (usually `borg`).      |
 | `BORGBOX_SSH_PORT`        | `22`                     | Port included in `ssh_url` when non-default.  |
+| `BORGBOX_SCHEDULES`       | `~borg/schedules.json`   | Where the scheduler persists its state.       |
 
 The installer writes these to `/etc/borgbox/borgbox.env`.
 
