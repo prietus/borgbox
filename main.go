@@ -24,23 +24,26 @@ import (
 	"time"
 )
 
-const version = "0.4.0"
+const version = "0.5.0"
 
 var nameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 var jobIDRe = regexp.MustCompile(`^j_[a-f0-9]{1,32}$`)
 var borgboxTagRe = regexp.MustCompile(`# borgbox:([a-z0-9][a-z0-9-]*)`)
+var commandRe = regexp.MustCompile(`command="([^"]+)"`)
 
 var errKeyExists = errors.New("repo already registered; delete first or use a different name")
+var errKeyNotFound = errors.New("repo has no borgbox-managed key")
 
 type Config struct {
-	Addr           string
-	RepoRoot       string
-	AuthKeys       string
-	Token          string
-	SSHHost        string
-	SSHUser        string
-	SSHPort        int
-	SchedulesPath  string
+	Addr          string
+	RepoRoot      string
+	AuthKeys      string
+	Token         string
+	SSHHost       string
+	SSHUser       string
+	SSHPort       int
+	SchedulesPath string
+	AlertsPath    string
 }
 
 type Server struct {
@@ -49,11 +52,22 @@ type Server struct {
 	mu        sync.Mutex
 	jobs      *jobManager
 	scheduler *Scheduler
+	monitor   *Monitor
 }
 
 type createRepoReq struct {
-	Name   string `json:"name"`
-	Pubkey string `json:"pubkey"`
+	Name       string `json:"name"`
+	Pubkey     string `json:"pubkey"`
+	AppendOnly bool   `json:"append_only"`
+}
+
+type patchRepoReq struct {
+	AppendOnly *bool `json:"append_only"`
+}
+
+type repoKeyState struct {
+	Registered bool
+	AppendOnly bool
 }
 
 type repoInfo struct {
@@ -61,6 +75,7 @@ type repoInfo struct {
 	Path        string `json:"path"`
 	SSHURL      string `json:"ssh_url"`
 	Registered  bool   `json:"registered"`
+	AppendOnly  bool   `json:"append_only"`
 	SizeBytes   int64  `json:"size_bytes"`
 	Initialized bool   `json:"initialized"`
 	ModifiedAt  string `json:"modified_at"`
@@ -373,6 +388,7 @@ func main() {
 	flag.StringVar(&cfg.SSHHost, "ssh-host", env("BORGBOX_SSH_HOST", ""), "hostname used to build ssh_url in repo responses")
 	flag.StringVar(&cfg.SSHUser, "ssh-user", env("BORGBOX_SSH_USER", ""), "user used to build ssh_url (default: current user)")
 	flag.StringVar(&cfg.SchedulesPath, "schedules", env("BORGBOX_SCHEDULES", ""), "path to schedules.json (default: <home>/schedules.json)")
+	flag.StringVar(&cfg.AlertsPath, "alerts", env("BORGBOX_ALERTS", ""), "path to alerts.json (default: <home>/alerts.json)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
@@ -412,6 +428,11 @@ func main() {
 			cfg.SchedulesPath = filepath.Join(u.HomeDir, "schedules.json")
 		}
 	}
+	if cfg.AlertsPath == "" {
+		if u, err := user.Current(); err == nil {
+			cfg.AlertsPath = filepath.Join(u.HomeDir, "alerts.json")
+		}
+	}
 	if strings.HasPrefix(cfg.Token, "@") {
 		b, err := os.ReadFile(strings.TrimPrefix(cfg.Token, "@"))
 		if err != nil {
@@ -434,6 +455,13 @@ func main() {
 	s.scheduler = sched
 	go s.scheduler.start()
 
+	mon, err := newMonitor(cfg.AlertsPath, cfg.RepoRoot)
+	if err != nil {
+		log.Fatalf("monitor init: %v", err)
+	}
+	s.monitor = mon
+	go s.monitor.start()
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/health", s.health)
 	mux.HandleFunc("GET /api/v1/info", s.auth(s.info))
@@ -443,6 +471,7 @@ func main() {
 	mux.HandleFunc("POST /api/v1/repos", s.auth(s.createRepo))
 	mux.HandleFunc("POST /api/v1/repos/import", s.auth(s.importRepo))
 	mux.HandleFunc("GET /api/v1/repos/{name}", s.auth(s.getRepo))
+	mux.HandleFunc("PATCH /api/v1/repos/{name}", s.auth(s.patchRepo))
 	mux.HandleFunc("DELETE /api/v1/repos/{name}", s.auth(s.deleteRepo))
 	mux.HandleFunc("GET /api/v1/repos/{name}/archives", s.auth(s.listArchives))
 	mux.HandleFunc("POST /api/v1/repos/{name}/break-lock", s.auth(s.breakLock))
@@ -458,6 +487,13 @@ func main() {
 	mux.HandleFunc("DELETE /api/v1/schedules/{id}", s.auth(s.deleteSchedule))
 	mux.HandleFunc("GET /api/v1/repos/{name}/schedules", s.auth(s.listRepoSchedules))
 	mux.HandleFunc("POST /api/v1/repos/{name}/schedules", s.auth(s.createSchedule))
+	mux.HandleFunc("GET /api/v1/alerts", s.auth(s.listAlerts))
+	mux.HandleFunc("GET /api/v1/alerts/{id}", s.auth(s.getAlert))
+	mux.HandleFunc("PATCH /api/v1/alerts/{id}", s.auth(s.patchAlert))
+	mux.HandleFunc("DELETE /api/v1/alerts/{id}", s.auth(s.deleteAlert))
+	mux.HandleFunc("POST /api/v1/alerts/{id}/test", s.auth(s.testAlert))
+	mux.HandleFunc("GET /api/v1/repos/{name}/alerts", s.auth(s.listRepoAlerts))
+	mux.HandleFunc("POST /api/v1/repos/{name}/alerts", s.auth(s.createAlert))
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
@@ -551,7 +587,7 @@ func (s *Server) listRepos(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	registered := s.registeredRepos()
+	states := s.scanAuthKeys()
 	out := []repoInfo{}
 	for _, e := range entries {
 		if !e.IsDir() {
@@ -559,7 +595,7 @@ func (s *Server) listRepos(w http.ResponseWriter, r *http.Request) {
 		}
 		p := filepath.Join(s.cfg.RepoRoot, e.Name())
 		info, _ := e.Info()
-		out = append(out, s.buildRepoInfo(e.Name(), p, info, registered))
+		out = append(out, s.buildRepoInfo(e.Name(), p, info, states))
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -575,24 +611,36 @@ func (s *Server) sshURL(repoPath string) string {
 	return fmt.Sprintf("ssh://%s@%s%s%s", s.cfg.SSHUser, s.cfg.SSHHost, port, repoPath)
 }
 
-func (s *Server) registeredRepos() map[string]bool {
-	out := map[string]bool{}
+func (s *Server) scanAuthKeys() map[string]repoKeyState {
+	out := map[string]repoKeyState{}
 	b, err := os.ReadFile(s.cfg.AuthKeys)
 	if err != nil {
 		return out
 	}
-	for _, m := range borgboxTagRe.FindAllStringSubmatch(string(b), -1) {
-		out[m[1]] = true
+	for _, line := range strings.Split(string(b), "\n") {
+		tag := borgboxTagRe.FindStringSubmatch(line)
+		if tag == nil {
+			continue
+		}
+		st := repoKeyState{Registered: true}
+		if cm := commandRe.FindStringSubmatch(line); cm != nil {
+			if strings.Contains(cm[1], "--append-only") {
+				st.AppendOnly = true
+			}
+		}
+		out[tag[1]] = st
 	}
 	return out
 }
 
-func (s *Server) buildRepoInfo(name, path string, info os.FileInfo, registered map[string]bool) repoInfo {
+func (s *Server) buildRepoInfo(name, path string, info os.FileInfo, states map[string]repoKeyState) repoInfo {
+	st := states[name]
 	ri := repoInfo{
 		Name:        name,
 		Path:        path,
 		SSHURL:      s.sshURL(path),
-		Registered:  registered[name],
+		Registered:  st.Registered,
+		AppendOnly:  st.AppendOnly,
 		SizeBytes:   dirSize(path),
 		Initialized: fileExists(filepath.Join(path, "config")),
 	}
@@ -628,7 +676,7 @@ func (s *Server) createRepo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.addAuthorizedKey(req.Name, req.Pubkey); err != nil {
+	if err := s.addAuthorizedKey(req.Name, req.Pubkey, req.AppendOnly); err != nil {
 		if errors.Is(err, errKeyExists) {
 			writeErr(w, http.StatusConflict, err.Error())
 			return
@@ -638,7 +686,7 @@ func (s *Server) createRepo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	st, _ := os.Stat(repoPath)
-	ri := s.buildRepoInfo(req.Name, repoPath, st, map[string]bool{req.Name: true})
+	ri := s.buildRepoInfo(req.Name, repoPath, st, map[string]repoKeyState{req.Name: {Registered: true, AppendOnly: req.AppendOnly}})
 	writeJSON(w, http.StatusCreated, ri)
 }
 
@@ -672,7 +720,7 @@ func (s *Server) importRepo(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "not a borg repo (missing config)")
 		return
 	}
-	if err := s.addAuthorizedKey(req.Name, req.Pubkey); err != nil {
+	if err := s.addAuthorizedKey(req.Name, req.Pubkey, req.AppendOnly); err != nil {
 		if errors.Is(err, errKeyExists) {
 			writeErr(w, http.StatusConflict, err.Error())
 			return
@@ -680,7 +728,7 @@ func (s *Server) importRepo(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "authorized_keys: "+err.Error())
 		return
 	}
-	ri := s.buildRepoInfo(req.Name, repoPath, st, map[string]bool{req.Name: true})
+	ri := s.buildRepoInfo(req.Name, repoPath, st, map[string]repoKeyState{req.Name: {Registered: true, AppendOnly: req.AppendOnly}})
 	writeJSON(w, http.StatusCreated, ri)
 }
 
@@ -696,8 +744,8 @@ func (s *Server) getRepo(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "repo not found")
 		return
 	}
-	registered := s.registeredRepos()
-	out := repoDetail{repoInfo: s.buildRepoInfo(name, repoPath, st, registered)}
+	states := s.scanAuthKeys()
+	out := repoDetail{repoInfo: s.buildRepoInfo(name, repoPath, st, states)}
 	if out.Initialized {
 		parseRepoConfig(filepath.Join(repoPath, "config"), &out)
 		out.Segments, out.LastWrite = scanDataDir(filepath.Join(repoPath, "data"))
@@ -761,6 +809,43 @@ func scanDataDir(path string) (int, string) {
 	return count, latest.UTC().Format(time.RFC3339)
 }
 
+func (s *Server) patchRepo(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if !nameRe.MatchString(name) {
+		writeErr(w, http.StatusBadRequest, "invalid name")
+		return
+	}
+	var req patchRepoReq
+	if err := json.NewDecoder(io.LimitReader(r.Body, 16*1024)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if req.AppendOnly == nil {
+		writeErr(w, http.StatusBadRequest, "nothing to update")
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	repoPath := filepath.Join(s.cfg.RepoRoot, name)
+	st, err := os.Stat(repoPath)
+	if err != nil || !st.IsDir() {
+		writeErr(w, http.StatusNotFound, "repo not found")
+		return
+	}
+	if err := s.setAppendOnly(name, *req.AppendOnly); err != nil {
+		if errors.Is(err, errKeyNotFound) {
+			writeErr(w, http.StatusConflict, "repo has no borgbox-managed key (import or create first)")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "authorized_keys: "+err.Error())
+		return
+	}
+	ri := s.buildRepoInfo(name, repoPath, st, s.scanAuthKeys())
+	writeJSON(w, http.StatusOK, ri)
+}
+
 func (s *Server) deleteRepo(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if !nameRe.MatchString(name) {
@@ -780,12 +865,17 @@ func (s *Server) deleteRepo(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "authorized_keys: "+err.Error())
 		return
 	}
+	if s.monitor != nil {
+		s.monitor.deleteByRepo(name)
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
 // addAuthorizedKey appends a key with a forced borg serve command restricted
 // to the repo's directory. The line is tagged so it can be removed later.
-func (s *Server) addAuthorizedKey(name, pubkey string) error {
+// When appendOnly is true, --append-only is added to the serve command so the
+// client can create new archives but cannot delete them.
+func (s *Server) addAuthorizedKey(name, pubkey string, appendOnly bool) error {
 	if err := os.MkdirAll(filepath.Dir(s.cfg.AuthKeys), 0o700); err != nil {
 		return err
 	}
@@ -805,8 +895,12 @@ func (s *Server) addAuthorizedKey(name, pubkey string) error {
 	}
 
 	repoPath := filepath.Join(s.cfg.RepoRoot, name)
-	line := fmt.Sprintf("command=\"borg serve --restrict-to-repository %s\",restrict %s %s\n",
-		repoPath, strings.TrimSpace(pubkey), tag)
+	serveCmd := "borg serve --restrict-to-repository " + repoPath
+	if appendOnly {
+		serveCmd += " --append-only"
+	}
+	line := fmt.Sprintf("command=\"%s\",restrict %s %s\n",
+		serveCmd, strings.TrimSpace(pubkey), tag)
 
 	if len(existing) > 0 && existing[len(existing)-1] != '\n' {
 		if _, err := f.Write([]byte("\n")); err != nil {
@@ -817,6 +911,41 @@ func (s *Server) addAuthorizedKey(name, pubkey string) error {
 		return err
 	}
 	return f.Sync()
+}
+
+// setAppendOnly rewrites the command= portion of the borgbox-managed line in
+// authorized_keys for `name`, adding or removing --append-only. Returns
+// errKeyNotFound if no tagged line exists.
+func (s *Server) setAppendOnly(name string, appendOnly bool) error {
+	b, err := os.ReadFile(s.cfg.AuthKeys)
+	if err != nil {
+		return err
+	}
+	tag := fmt.Sprintf("# borgbox:%s", name)
+	lines := strings.Split(string(b), "\n")
+	found := false
+	for i, line := range lines {
+		if !strings.Contains(line, tag) {
+			continue
+		}
+		found = true
+		lines[i] = rewriteAppendOnlyFlag(line, appendOnly)
+	}
+	if !found {
+		return errKeyNotFound
+	}
+	return os.WriteFile(s.cfg.AuthKeys, []byte(strings.Join(lines, "\n")), 0o600)
+}
+
+func rewriteAppendOnlyFlag(line string, appendOnly bool) string {
+	return commandRe.ReplaceAllStringFunc(line, func(match string) string {
+		inner := commandRe.FindStringSubmatch(match)[1]
+		inner = strings.ReplaceAll(inner, " --append-only", "")
+		if appendOnly {
+			inner += " --append-only"
+		}
+		return `command="` + inner + `"`
+	})
 }
 
 func (s *Server) removeAuthorizedKey(name string) error {

@@ -49,6 +49,13 @@ sudo ./install.sh --dist ./dist
 Base URL: `http://<host>:9999/api/v1`
 Auth: `Authorization: Bearer <token>` (all endpoints except `/health`).
 
+Every non-2xx response (400, 401, 404, 409, 500, 502, …) has the same JSON
+shape, so clients only need one error decoder:
+
+```json
+{ "error": "human-readable message" }
+```
+
 | Method   | Path                                  | Auth | Description                                       |
 |----------|---------------------------------------|------|---------------------------------------------------|
 | `GET`    | `/api/v1/health`                      | no   | Liveness check.                                   |
@@ -59,6 +66,7 @@ Auth: `Authorization: Bearer <token>` (all endpoints except `/health`).
 | `POST`   | `/api/v1/repos`                       | yes  | Create repo directory and register pubkey.        |
 | `POST`   | `/api/v1/repos/import`                | yes  | Register an existing on-disk repo (no mkdir).     |
 | `GET`    | `/api/v1/repos/{name}`                | yes  | Detailed stats for one repo.                      |
+| `PATCH`  | `/api/v1/repos/{name}`                | yes  | Toggle `append_only` on the managed key.          |
 | `DELETE` | `/api/v1/repos/{name}`                | yes  | Remove directory and authorized_keys entry.       |
 | `GET`    | `/api/v1/repos/{name}/archives`       | yes  | List archives via `borg list --json`.             |
 | `POST`   | `/api/v1/repos/{name}/break-lock`     | yes  | Run `borg break-lock` on a stuck repo (sync).     |
@@ -74,6 +82,13 @@ Auth: `Authorization: Bearer <token>` (all endpoints except `/health`).
 | `DELETE` | `/api/v1/schedules/{id}`              | yes  | Remove a schedule.                                |
 | `GET`    | `/api/v1/repos/{name}/schedules`      | yes  | List schedules for a single repo.                 |
 | `POST`   | `/api/v1/repos/{name}/schedules`      | yes  | Create a schedule for a repo.                     |
+| `GET`    | `/api/v1/alerts`                      | yes  | List all stale-backup alerts.                     |
+| `GET`    | `/api/v1/alerts/{id}`                 | yes  | Fetch one alert.                                  |
+| `PATCH`  | `/api/v1/alerts/{id}`                 | yes  | Enable/disable or edit an alert.                  |
+| `DELETE` | `/api/v1/alerts/{id}`                 | yes  | Remove an alert.                                  |
+| `POST`   | `/api/v1/alerts/{id}/test`            | yes  | Fire a synthetic webhook to verify delivery.      |
+| `GET`    | `/api/v1/repos/{name}/alerts`         | yes  | List alerts for a single repo.                    |
+| `POST`   | `/api/v1/repos/{name}/alerts`         | yes  | Create an alert for a repo.                       |
 
 ### Create a repo
 
@@ -84,7 +99,8 @@ Authorization: Bearer <token>
 
 {
   "name": "mac",
-  "pubkey": "ssh-ed25519 AAAAC3... user@host"
+  "pubkey": "ssh-ed25519 AAAAC3... user@host",
+  "append_only": false
 }
 ```
 
@@ -97,6 +113,7 @@ Authorization: Bearer <token>
   "path": "/var/lib/borg/repos/mac",
   "ssh_url": "ssh://borg@hive.local/var/lib/borg/repos/mac",
   "registered": true,
+  "append_only": false,
   "size_bytes": 0,
   "initialized": false,
   "modified_at": "2026-04-13T14:32:08Z"
@@ -115,6 +132,32 @@ borg init --encryption=repokey-blake2 <ssh_url>
 The daemon never calls `borg init` itself — it only prepares the server side
 so the client's first `borg init` over SSH succeeds.
 
+### Append-only mode
+
+Setting `"append_only": true` adds `--append-only` to the forced `borg serve`
+command in `authorized_keys`. A client using that key can create new archives
+but cannot delete or prune them — a compromised laptop can't wipe your
+backups. Server-side `check`/`prune`/`compact` (manual or scheduled) keep
+working because borgbox invokes `borg` locally, not through SSH.
+
+Toggle on an existing repo without touching the pubkey:
+
+```http
+PATCH /api/v1/repos/mac
+Content-Type: application/json
+Authorization: Bearer <token>
+
+{"append_only": true}
+```
+
+Returns `200 OK` with the updated `repoInfo`. `409 Conflict` if the repo has
+no `# borgbox:<name>` line (e.g. you imported a directory but haven't
+attached a key yet).
+
+The toggle is persistent in `authorized_keys`, so it takes effect on the
+**next** SSH connection. Already-running `borg serve` sessions keep the
+flag they started with — nothing is killed mid-backup.
+
 ### List and import existing repos
 
 `GET /api/v1/repos` walks the repo root and returns every directory it finds,
@@ -127,6 +170,7 @@ client which ones already have an `authorized_keys` entry:
     "name": "mac",
     "ssh_url": "ssh://borg@hive.local/var/lib/borg/repos/mac",
     "registered": true,
+    "append_only": true,
     "initialized": true,
     "size_bytes": 12345678,
     "path": "/var/lib/borg/repos/mac",
@@ -136,6 +180,7 @@ client which ones already have an `authorized_keys` entry:
     "name": "nas-archive",
     "ssh_url": "ssh://borg@hive.local/var/lib/borg/repos/nas-archive",
     "registered": false,
+    "append_only": false,
     "initialized": true,
     "size_bytes": 987654321,
     "path": "/var/lib/borg/repos/nas-archive",
@@ -358,6 +403,117 @@ Each schedule tracks `last_run`, `last_status` (`running`, `done`,
 `last_job_id`, so a client can render "last check: 2 days ago ✅" without
 correlating against `/jobs` by hand.
 
+### Stale-backup alerts
+
+borgbox can fire an outbound webhook when a repo stops receiving writes,
+so you get paged if a laptop stops backing up instead of finding out the
+hard way. "Last write" is derived from the most recent mtime under
+`repos/<name>/data/` — the monitor works on encrypted repos without
+ever seeing a passphrase.
+
+Alerts are persisted to `~borg/alerts.json` (override with
+`BORGBOX_ALERTS`). The monitor ticks every 5 minutes and transitions are
+**edge-triggered**: one webhook on `ok → stale`, one on `stale → ok`.
+Set `renotify_hours > 0` to also re-fire periodically while the state
+stays `stale`.
+
+Create an alert:
+
+```http
+POST /api/v1/repos/mac/alerts
+Content-Type: application/json
+Authorization: Bearer <token>
+
+{
+  "stale_after_hours": 26,
+  "webhook_url": "https://ntfy.sh/my-topic",
+  "enabled": true,
+  "renotify_hours": 0,
+  "secret": "s3cret-for-hmac"
+}
+```
+
+`secret` is optional. When set, every outbound webhook is signed with
+`X-BorgBox-Signature: sha256=<hex-hmac>` computed over the raw JSON body
+using HMAC-SHA256 and this key. The receiver can recompute the MAC to
+verify the call really came from borgbox. The secret is **write-only** —
+it never comes back in API responses; instead the alert carries a
+`has_secret` boolean so UIs can show whether signing is on.
+
+Response:
+
+```json
+{
+  "id": "alert_3a9aa165ec83a4e0",
+  "repo": "mac",
+  "stale_after_hours": 26,
+  "webhook_url": "https://ntfy.sh/my-topic",
+  "enabled": true,
+  "renotify_hours": 0,
+  "has_secret": true,
+  "created_at": "2026-04-17T10:00:00Z",
+  "last_check_at": "",
+  "last_state": null,
+  "last_write": "",
+  "last_alerted_at": "",
+  "last_error": ""
+}
+```
+
+`last_state` is `null` until the first check; after that it transitions
+between `"ok"` and `"stale"`.
+
+Verify the webhook URL works before waiting for a real event:
+
+```http
+POST /api/v1/alerts/alert_3a9aa165ec83a4e0/test
+Authorization: Bearer <token>
+```
+
+Returns `200 {"status":"ok"}` on success or `502` with the delivery error
+(bad TLS, 4xx/5xx from the target, etc.). `/test` fires once with no
+retries so the caller gets a fast yes/no.
+
+Toggle without deleting, or rotate the signing secret:
+
+```http
+PATCH /api/v1/alerts/alert_3a9aa165ec83a4e0
+{"enabled": false}
+```
+
+```http
+PATCH /api/v1/alerts/alert_3a9aa165ec83a4e0
+{"secret": "new-key"}          # rotate
+{"secret": ""}                  # clear (stop signing)
+```
+
+**Webhook payload** (POST, `Content-Type: application/json`):
+
+```json
+{
+  "event": "stale",
+  "repo": "mac",
+  "hostname": "hive.local",
+  "last_write": "2026-04-15T02:11:00Z",
+  "stale_after_hours": 26,
+  "hours_since_last_write": 48
+}
+```
+
+`event` is one of `stale`, `recovered`, or `test`. `hours_since_last_write`
+is a whole number (int64, hours truncated). Any 2xx response is treated
+as success; 3xx+ or network errors are stored in `last_error` and logged.
+
+**Delivery** has a 10s HTTP timeout per attempt. Scheduled alerts retry
+up to 3 times total with 2s and 10s back-off between attempts, but only
+for transport errors, 408, 429, or 5xx responses. Any other 4xx fails
+immediately — a misconfigured webhook won't recover from being hit
+harder. `/test` never retries.
+
+**Cascade delete**: when a repo is removed via `DELETE /api/v1/repos/{name}`,
+all of its alerts are dropped alongside it so no orphans remain in
+`alerts.json`.
+
 ## What borgbox is *not*
 
 - Not a borg server. `borg serve` is invoked by sshd via a forced command in
@@ -416,6 +572,7 @@ The daemon reads these env vars (also accepted as CLI flags):
 | `BORGBOX_SSH_USER`        | current user             | User used in `ssh_url` (usually `borg`).      |
 | `BORGBOX_SSH_PORT`        | `22`                     | Port included in `ssh_url` when non-default.  |
 | `BORGBOX_SCHEDULES`       | `~borg/schedules.json`   | Where the scheduler persists its state.       |
+| `BORGBOX_ALERTS`          | `~borg/alerts.json`      | Where the stale-backup monitor persists alerts. |
 
 The installer writes these to `/etc/borgbox/borgbox.env`.
 

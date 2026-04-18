@@ -1,5 +1,5 @@
 BINARY := borgbox
-VERSION := 0.4.0
+VERSION := 0.5.0
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
 .PHONY: all build clean test run dist
