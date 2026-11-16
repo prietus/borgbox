@@ -2,7 +2,7 @@
 # Borgbox server installer.
 #
 # Usage:
-#   curl -fsSL https://github.com/cprieto/borgbox/releases/latest/download/install.sh | sudo bash
+#   curl -fsSL https://github.com/prietus/borgbox/releases/latest/download/install.sh | sudo bash
 #
 # Options:
 #   --addr :9999          Listen address (default :9999)
@@ -12,7 +12,7 @@
 #   --dist /path          Local dist/ directory (for dev; skips download)
 #
 # Environment variables:
-#   BORGBOX_REPO=owner/repo      GitHub repo (default cprieto/borgbox)
+#   BORGBOX_REPO=owner/repo      GitHub repo (default prietus/borgbox)
 #   BORGBOX_VERSION=v0.1.0       Same as --version
 set -euo pipefail
 
@@ -62,7 +62,7 @@ else
     fi
     BASE="https://github.com/$REPO/releases/download/$VERSION"
     echo "downloading $BASE/$BINARY_NAME"
-    curl -fsSL -o "$TMP/borgbox" "$BASE/$BINARY_NAME"
+    curl -fsSL -o "$TMP/$BINARY_NAME" "$BASE/$BINARY_NAME"
 
     if curl -fsSL -o "$TMP/SHA256SUMS" "$BASE/SHA256SUMS" 2>/dev/null; then
         ( cd "$TMP" && grep "$BINARY_NAME" SHA256SUMS | sha256sum -c - ) \
@@ -71,6 +71,7 @@ else
     else
         echo "warning: no SHA256SUMS file in release, skipping verification" >&2
     fi
+    mv "$TMP/$BINARY_NAME" "$TMP/borgbox"
 fi
 chmod +x "$TMP/borgbox"
 

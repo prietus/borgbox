@@ -10,7 +10,7 @@ keys, or see stats.
 On your Linux server (the one that will host the repos):
 
 ```bash
-curl -fsSL https://github.com/cprieto/borgbox/releases/latest/download/install.sh | sudo bash
+curl -fsSL https://github.com/prietus/borgbox/releases/latest/download/install.sh | sudo bash
 ```
 
 The installer:
@@ -29,13 +29,13 @@ Options:
 sudo bash install.sh \
   --addr :9999 \
   --home /var/lib/borg \
-  --version v0.1.0
+  --version v0.5.0
 ```
 
 Pin a specific version:
 
 ```bash
-curl -fsSL https://github.com/cprieto/borgbox/releases/download/v0.1.0/install.sh | sudo bash
+curl -fsSL https://github.com/prietus/borgbox/releases/latest/download/install.sh | sudo bash -s -- --version v0.5.0
 ```
 
 Install from a local `dist/` during development:
